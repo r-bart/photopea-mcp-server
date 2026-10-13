@@ -1,0 +1,90 @@
+{
+  "method": "TypeScript AST: 1 + if/loops/non-default cases/catch/ternaries/&&/||/??, excluding nested functions; approximate, not canonical cyclomatic complexity. TS source only; HTML frontend excluded.",
+  "functions": 126,
+  "top": [
+    {
+      "file": "src/tools/image.ts",
+      "name": "anonymous",
+      "line": 35,
+      "lines": 60,
+      "branchApprox": 19
+    },
+    {
+      "file": "src/bridge/script-builder.ts",
+      "name": "buildApplyAdjustment",
+      "line": 551,
+      "lines": 44,
+      "branchApprox": 17
+    },
+    {
+      "file": "src/bridge/websocket-server.ts",
+      "name": "handleClientMessage",
+      "line": 327,
+      "lines": 41,
+      "branchApprox": 14
+    },
+    {
+      "file": "src/bridge/script-builder.ts",
+      "name": "buildApplyFilter",
+      "line": 596,
+      "lines": 40,
+      "branchApprox": 13
+    },
+    {
+      "file": "src/bridge/script-builder.ts",
+      "name": "buildAddText",
+      "line": 407,
+      "lines": 58,
+      "branchApprox": 10
+    },
+    {
+      "file": "src/tools/document.ts",
+      "name": "anonymous",
+      "line": 44,
+      "lines": 28,
+      "branchApprox": 10
+    },
+    {
+      "file": "src/bridge/websocket-server.ts",
+      "name": "processNext",
+      "line": 267,
+      "lines": 55,
+      "branchApprox": 8
+    },
+    {
+      "file": "src/bridge/script-builder.ts",
+      "name": "buildEditText",
+      "line": 466,
+      "lines": 35,
+      "branchApprox": 8
+    },
+    {
+      "file": "src/bridge/script-builder.ts",
+      "name": "buildTransformLayer",
+      "line": 637,
+      "lines": 26,
+      "branchApprox": 8
+    },
+    {
+      "file": "src/bridge/script-builder.ts",
+      "name": "buildMakeSelection",
+      "line": 718,
+      "lines": 34,
+      "branchApprox": 6
+    },
+    {
+      "file": "src/bridge/script-builder.ts",
+      "name": "buildSetLayerProperties",
+      "line": 269,
+      "lines": 23,
+      "branchApprox": 6
+    },
+    {
+      "file": "src/tools/export.ts",
+      "name": "anonymous",
+      "line": 71,
+      "lines": 11,
+      "branchApprox": 6
+    }
+  ]
+}

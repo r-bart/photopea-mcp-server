@@ -1,0 +1,15 @@
+import { runInNewContext } from 'node:vm';
+import { registerExportTools } from '../../src/tools/export.ts';
+import { buildApplyFilter } from '../../src/bridge/script-builder.ts';
+const scripts: string[] = [];
+const handlers: Record<string, Function> = {};
+const bridge = {sendActivity(){}, async executeScript(script: string){scripts.push(script);return {success:true,data:'[]'};}};
+registerExportTools({registerTool(name: string,_schema: unknown,handler: Function){handlers[name]=handler;}} as any,bridge as any);
+await handlers.photopea_list_fonts({search: "'+(injected=true)+'"});
+const scope = {injected:false,app:{fonts:[{postScriptName:'Arial'}],echoToOE(){}}};
+runInNewContext(scripts[0],scope);
+console.log('list_fonts readonly input executed injected expression:', scope.injected);
+const filterScript=buildApplyFilter({type:'gaussian_blur',settings:{radius:'(injected=true,2)'}});
+const filterScope={injected:false,app:{activeDocument:{activeLayer:{applyGaussianBlur(){}}},echoToOE(){}}};
+runInNewContext(filterScript,filterScope);
+console.log('filter numeric input executed injected expression:',filterScope.injected);

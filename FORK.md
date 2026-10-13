@@ -1,5 +1,7 @@
 # Livery workflow fork
 
+Current state (2026-10-14): version 0.3.0 is integrated into `main` through merged PRs #1–#3. The installed versioned package was checked against the validated build. See [LIVERY_WORKFLOWS.md](LIVERY_WORKFLOWS.md) for implemented contracts and evidence. The initial investigation below is historical; the original editor connection remains preserved separately for recovery.
+
 Fork: https://github.com/r-bart/photopea-mcp-server
 
 Upstream: https://github.com/attalla1/photopea-mcp-server, MIT license retained. Starting commit `ef544a62485dc4e9aeeebff96542389f66298524`, package version 0.1.1. Clone is independent of `sim-livery-tools`; large livery assets stay outside both repositories.
@@ -14,7 +16,7 @@ The regression test starts a pending operation, connects a second client, and ch
 
 Build now applies executable permissions through Node rather than shell `chmod`, so `npm run build` works in Windows PowerShell as well as Unix environments.
 
-## Next investigations
+## Initial investigations (historical)
 
 1. **Timeout queue ownership.** Timers start while requests are queued. When an active request expires, the server advances the queue although the iframe may still be executing it; the frontend has only one `pendingId`. Reproduce delayed responses, distinguish queue timeout from execution timeout, and prevent a late `done` from completing another operation. Do not retry relative edits automatically.
 2. **Large PSD transport.** Export travels as ArrayBuffer → binary string → base64 → JSON → WebSocket. The server uses the ws default payload limit; inspect size/memory/error reporting with synthetic payloads. This is a candidate mechanism, not a proven explanation of the user's v18 disconnect.
@@ -23,4 +25,4 @@ Build now applies executable permissions through Node rather than shell `chmod`,
 5. **Document targeting.** Add inspect/list/select support with unambiguous session/document identity and checks before mutating. Current tools act on the active document and layer names can repeat in groups.
 6. **Livery exports.** After transport reliability, add paired albedo/region exports, visibility restoration, durable PSD verification and TGA validation. Keep simulator-specific atlas data in skills.
 
-Upstream dependencies were installed without lifecycle scripts and audited by npm. Dependency updates require a separate compatibility review; no forced audit upgrade was applied. Production Codex configuration still points to the original installed package. Switch it only after a controlled test with a disposable document and a saved recovery copy of any live work.
+The initial upstream dependencies were installed without lifecycle scripts and audited by npm. Those findings describe that baseline, not the current dependency state. The fork now has a separate `photopea_livery` configuration and versioned installation; the original `photopea` configuration/process is preserved for recovery. The current chat still needs its new connection refreshed; the scoped package and registered tools passed independent stdio/SDK/editor checks without restarting the original session.

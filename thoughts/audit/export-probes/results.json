@@ -1,0 +1,64 @@
+[
+  {
+    "probe": "expectFiles accepts text result",
+    "result": {
+      "success": true,
+      "data": "ok",
+      "error": null
+    }
+  },
+  {
+    "probe": "text result persisted as PSD",
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Image exported to: C:\\Users\\rober\\Documents\\Projects\\photopea-mcp-server\\thoughts\\audit\\export-probes\\false-success.psd"
+        }
+      ]
+    },
+    "bytes": 2,
+    "contents": "ok"
+  },
+  {
+    "probe": "frontend done without binary",
+    "messages": [
+      {
+        "type": "result",
+        "id": "export-without-file",
+        "success": true,
+        "data": null,
+        "error": null
+      }
+    ]
+  },
+  {
+    "probe": "ws default-size ceiling via synthetic frame header",
+    "message": "Max payload size exceeded",
+    "code": "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH"
+  },
+  {
+    "probe": "size arithmetic",
+    "wsMaxBytes": 104857600,
+    "v17Bytes": 77303580,
+    "v17Base64Bytes": 103071440,
+    "binaryCeilingBeforeEnvelope": 78643200,
+    "estimatedNextPsdBytes": 79873269,
+    "estimatedNextBase64Bytes": 106497692
+  },
+  {
+    "probe": "real localhost websocket oversized masked frame header",
+    "serverError": {
+      "message": "Max payload size exceeded",
+      "code": "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH"
+    },
+    "close": {
+      "code": 1009,
+      "reason": ""
+    },
+    "envelopeBytes": 136,
+    "exactMaxPsdBytes": 78643098,
+    "v17MarginBytes": 1339518,
+    "v17MarginMiB": 1.2774639129638672
+  }
+]
