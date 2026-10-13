@@ -548,8 +548,18 @@ export function buildAddShape(params: AddShapeParams): string {
 // Image operations
 // ---------------------------------------------------------------------------
 
+function validateSettings(settings:Record<string,number|string|boolean>,curves=false):void {
+  for(const [key,value] of Object.entries(settings)){
+    if(curves&&key==='points'){
+      const points=typeof value==='string'?JSON.parse(value):null;
+      if(!Array.isArray(points)||points.length<2||points.length>64||points.some((p,i)=>!Array.isArray(p)||p.length!==2||p.some(v=>typeof v!=='number'||!Number.isFinite(v)||v<0||v>255)||(i>0&&p[0]<=points[i-1][0])))throw new Error('Invalid curve points');
+    }else if(typeof value!=='number'||!Number.isFinite(value))throw new Error(`Setting ${key} must be a finite number`);
+  }
+}
+
 export function buildApplyAdjustment(params: ApplyAdjustmentParams): string {
   const { type, settings = {} } = params;
+  validateSettings(settings, type==='curves');
   const lines: string[] = [];
   const layer = `app.activeDocument.activeLayer`;
 
@@ -595,6 +605,7 @@ export function buildApplyAdjustment(params: ApplyAdjustmentParams): string {
 
 export function buildApplyFilter(params: ApplyFilterParams): string {
   const { type, settings = {} } = params;
+  validateSettings(settings);
   const lines: string[] = [];
   const layer = `app.activeDocument.activeLayer`;
 

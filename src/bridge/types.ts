@@ -26,6 +26,7 @@ export interface BridgeResult {
   error: string | null;
   operationId?: string;
   state?: string;
+  bundle?: { manifestPath:string; status:'complete'|'incomplete' };
   artifact?: {
     path: string;
     byteLength: number;

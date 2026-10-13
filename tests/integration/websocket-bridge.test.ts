@@ -45,11 +45,13 @@ describe('authenticated operation bridge',()=>{
   it('preserves active ownership after timeout, ignores unsent IDs and reconciles a late result',async()=>{
     const a=bridge.executeScript('A');const sentA=await c.next('execute');
     const b=bridge.executeScript('B');
-    expect(await a).toMatchObject({success:false,state:'indeterminate',operationId:sentA.id});
+    const timedOut=await a;expect(timedOut).toMatchObject({success:false,state:'indeterminate'});
+    expect(bridge.getOperation(sentA.id)?.parentOperationId).toBe(timedOut.operationId);
     expect(bridge.getStatus().queued).toBe(1);
     c.result(randomUUID(),'unsent');c.result(sentA.id,'late A');
     const sentB=await c.next('execute');expect(sentB.script).toBe('B');
     c.result(sentB.id,'B');expect((await b).data).toBe('B');expect(bridge.getOperation(sentA.id)?.result?.data).toBe('late A');
+    expect(bridge.getOperation(timedOut.operationId!)?.result).toMatchObject({success:true,data:'late A'});
   });
   it('rejects a malformed result without losing the operation',async()=>{
     const p=bridge.executeScript('A'),m=await c.next('execute');
@@ -57,6 +59,14 @@ describe('authenticated operation bridge',()=>{
     expect((await p).state).toBe('indeterminate');
     expect(bridge.operations.activeId).toBe(m.id);c.result(m.id,'valid');await c.next('settled');
     expect(bridge.getOperation(m.id)?.state).toBe('completed');
+  });
+  it('keeps compound workflows partial after a late step and never resumes their remaining edits',async()=>{
+    const p=bridge.runWorkflow(async()=>{const first=await bridge.executeScript('first');if(!first.success)return first;return bridge.executeScript('must not execute');});
+    const sent=await c.next('execute'),unknown=await p;
+    expect(unknown.state).toBe('indeterminate');
+    c.result(sent.id,'late');await c.next('settled');
+    expect(bridge.getOperation(unknown.operationId!)?.state).toBe('failed');
+    expect(c.events.filter(x=>x.type==='execute')).toHaveLength(1);
   });
   it('rejects text posing as a PSD and preserves an existing checkpoint',async()=>{
     const path=join(dir,'master.psd');await writeFile(path,'previous');
@@ -109,5 +119,19 @@ describe('authenticated operation bridge',()=>{
     const settledIndex=c.events.findIndex(x=>x.type==='settled'&&x.id===m.id),executeIndex=c.events.findIndex(x=>x.type==='execute'&&x.id===sent.id);
     expect(settledIndex).toBeGreaterThan(-1);expect(settledIndex).toBeLessThan(executeIndex);
     release();c.result(sent.id);expect((await next).success).toBe(true);
+  });
+  it('holds an entire workflow across steps, excluding unrelated calls',async()=>{
+    let continueStep!:()=>void;
+    const workflow=bridge.runWorkflow(async()=>{
+      const first=await bridge.executeScript('first');
+      await new Promise<void>(r=>{continueStep=r;});
+      const second=await bridge.executeScript('second');return {...second,data:first.data+' '+second.data};
+    });
+    const first=await c.next('execute');c.result(first.id,'first');await c.next('settled');
+    const unrelated=bridge.executeScript('unrelated');
+    await new Promise(r=>setTimeout(r,25));expect(c.messages.filter(x=>x.type==='execute')).toHaveLength(0);
+    continueStep();const second=await c.next('execute');expect(second.script).toBe('second');c.result(second.id,'second');
+    expect((await workflow).data).toBe('first second');
+    const external=await c.next('execute');expect(external.script).toBe('unrelated');c.result(external.id);await unrelated;
   });
 });

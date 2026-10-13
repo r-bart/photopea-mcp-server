@@ -3,7 +3,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
-import { dirname, join, resolve } from "path";
+import { dirname, join, resolve, isAbsolute } from "path";
 import { homedir } from "node:os";
 import { PhotopeaBridge } from "./bridge/websocket-server.js";
 import { createServer } from "./server.js";
@@ -12,11 +12,14 @@ import { findAvailablePort } from "./utils/platform.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const DEFAULT_PORT = 4117;
+const DEFAULT_PORT = Number(process.env.PHOTOPEA_PORT ?? 4117);
 
 async function main(): Promise<void> {
+  if(!Number.isInteger(DEFAULT_PORT)||DEFAULT_PORT<1024||DEFAULT_PORT>65535)throw new Error('PHOTOPEA_PORT must be an integer from 1024 to 65535');
+  const stateDirectory=process.env.PHOTOPEA_STATE_DIR ?? join(homedir(),'.photopea-mcp');
+  if(!isAbsolute(stateDirectory))throw new Error('PHOTOPEA_STATE_DIR must be absolute');
   const port = await findAvailablePort(DEFAULT_PORT);
-  const bridge = new PhotopeaBridge(port, { journalDirectory: join(homedir(), ".photopea-mcp", "operations") });
+  const bridge = new PhotopeaBridge(port, { journalDirectory: join(stateDirectory, 'operations') });
 
   // Serve the frontend HTML on HTTP GET /
   const httpServer = bridge.getHttpServer();

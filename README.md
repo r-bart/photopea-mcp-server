@@ -4,7 +4,7 @@
 
 <h1 align="center">Photopea MCP Server</h1>
 
-**Livery fork:** version 0.2.0 uses authenticated protocol 2, operation status/recovery and binary PSD checkpoints. See [CHECKPOINTS.md](CHECKPOINTS.md) for guarantees, independent tests and migration. Build this checkout with Node 22+; the upstream npm installation examples below do not install this fork. Original author and MIT license are preserved.
+**Livery fork:** version 0.3.0 adds explicit document/layer references, SVG atlas placement and coherent checkpoint/PNG bundles under one workflow owner. See [LIVERY_WORKFLOWS.md](LIVERY_WORKFLOWS.md) for contracts and isolated real-editor evidence, and [CHECKPOINTS.md](CHECKPOINTS.md) for binary transport/recovery. Build this checkout with Node 22+; the upstream npm examples below do not install this fork. Original author and MIT license are preserved.
 
 <p align="center">
   Design posters, edit photos, and transform images directly from your terminal. Powered by <a href="https://www.photopea.com">Photopea</a> -- a free, browser-based alternative to Photoshop -- connected to your AI agent via <a href="https://modelcontextprotocol.io">MCP</a>.

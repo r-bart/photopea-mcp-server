@@ -10,6 +10,8 @@ export interface OperationSnapshot {
   finishedAt?: number;
   result?: BridgeResult;
   candidate?: { path: string; byteLength: number; sha256: string; format: "psd" | "png" | "jpg" | "webp" | "svg" };
+  kind?: "step" | "command" | "load" | "export" | "workflow";
+  parentOperationId?: string;
 }
 interface Operation extends OperationSnapshot {
   dispatch?: (id: string) => void;
@@ -34,7 +36,7 @@ export class OperationManager {
   }
   private record(op: Operation): void { this.changed(this.snapshot(op.operationId)!); }
 
-  enqueue(dispatch: (id: string) => void, executionMs: number): { operationId: string; promise: Promise<BridgeResult> } {
+  enqueue(dispatch: (id: string) => void, executionMs: number, metadata: Pick<OperationSnapshot, "kind" | "parentOperationId"> = {}): { operationId: string; promise: Promise<BridgeResult> } {
     if (this.stopped) throw new Error("Bridge stopped");
     if (this.queue.length >= this.maxQueue) throw new Error("Operation queue is full");
     // Never evict work with an unknown outcome.
@@ -46,7 +48,7 @@ export class OperationManager {
     const operationId = randomUUID();
     let resolve!: (r: BridgeResult) => void;
     const promise = new Promise<BridgeResult>(r => { resolve = r; });
-    const op: Operation = { operationId, state: "queued", createdAt: Date.now(), dispatch, resolve, promise, executionMs };
+    const op: Operation = { operationId, state: "queued", createdAt: Date.now(), dispatch, resolve, promise, executionMs, ...metadata };
     op.queueTimer = setTimeout(() => this.finishQueued(op, "expired", "Queue deadline exceeded; not started"), this.queueMs);
     this.operations.set(operationId, op);
     this.queue.push(op);
@@ -75,26 +77,26 @@ export class OperationManager {
   snapshot(id: string): OperationSnapshot | undefined {
     const op = this.operations.get(id);
     if (!op) return undefined;
-    return { operationId: id, state: op.state, createdAt: op.createdAt, startedAt: op.startedAt, finishedAt: op.finishedAt, result: op.result, candidate: op.candidate };
+    return { operationId: id, state: op.state, createdAt: op.createdAt, startedAt: op.startedAt, finishedAt: op.finishedAt, result: op.result, candidate: op.candidate, kind:op.kind, parentOperationId:op.parentOperationId };
   }
   candidate(id: string, candidate: NonNullable<OperationSnapshot["candidate"]>): void {
     if (id !== this.activeId) throw new Error("Operation does not own editor");
     this.active!.candidate = candidate;
     this.record(this.active!);
   }
-  phase(id: string, state: "transferring" | "persisting"): void {
+  phase(id: string, state: "running" | "transferring" | "persisting", keepExecutionDeadline = false): void {
     if (id !== this.activeId) throw new Error("Operation does not own editor");
     const op = this.active!;
     if (op.state !== "indeterminate") op.state = state;
-    if (state === "transferring") clearTimeout(op.executionTimer);
+    if (state === "transferring" && !keepExecutionDeadline) clearTimeout(op.executionTimer);
     this.record(op);
   }
-  markIndeterminate(error: string): void {
+  markIndeterminate(error: string,partial?:BridgeResult): void {
     const op = this.active;
     if (!op) return;
     clearTimeout(op.executionTimer);
     op.state = "indeterminate";
-    op.result = { success: false, data: null, error: `${error} [operationId=${op.operationId}]`, operationId: op.operationId, state: "indeterminate" };
+    op.result = { ...partial,success: false, data: partial?.data??null, error: `${error} [operationId=${op.operationId}]`, operationId: op.operationId, state: "indeterminate" };
     this.record(op);
     op.resolve(op.result);
   }

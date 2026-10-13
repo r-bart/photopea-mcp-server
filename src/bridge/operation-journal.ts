@@ -26,7 +26,7 @@ export class OperationJournal {
         raw.state = queued ? "cancelled" : "indeterminate";
         if (queued) raw.finishedAt = Date.now();
         raw.result = { success: false, data: null, error: "Server restarted; no replay. Inspect artifact/document before retrying", operationId: raw.operationId, state: raw.state };
-        if (raw.candidate) {
+        if (raw.candidate && raw.kind !== "workflow") {
           try {
             const c = raw.candidate, hash = createHash("sha256");
             let length = 0;
