@@ -2,20 +2,47 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { PhotopeaBridge } from "../bridge/websocket-server.js";
-import type { BridgeFileResult } from "../bridge/types.js";
 import {
   buildExportImage,
   buildRunScript,
   buildUndo,
   buildRedo,
 } from "../bridge/script-builder.js";
-import { writeLocalFile } from "../utils/file-io.js";
+import { fetchUrlToBuffer } from "../utils/file-io.js";
 
 export function registerExportTools(server: McpServer, bridge: PhotopeaBridge): void {
+  server.registerTool("photopea_get_status", {
+    description: "Inspect bridge/session readiness, queue, and the active operation without opening a browser.",
+    inputSchema: {}, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+  }, async () => ({ content: [{ type: "text", text: JSON.stringify(bridge.getStatus()) }] }));
+  server.registerTool("photopea_get_operation", {
+    description: "Inspect an operation by ID, including late results and persisted artifact path/hash. Polling never repeats the operation.",
+    inputSchema: { operationId: z.string().uuid() }, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+  }, async ({ operationId }) => {
+    const op = bridge.getOperation(operationId);
+    return { isError: !op, content: [{ type: "text", text: JSON.stringify(op ?? { error: "Unknown or expired operation" }) }] };
+  });
+  server.registerTool("photopea_cancel_operation", {
+    description: "Cancel only a queued operation. A running Photopea execution cannot be interrupted or undone by this tool.",
+    inputSchema: { operationId: z.string().uuid() }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  }, async ({ operationId }) => {
+    try { return { content: [{ type: "text", text: bridge.cancelOperation(operationId) }] }; }
+    catch (e) { return { isError: true, content: [{ type: "text", text: (e as Error).message }] }; }
+  });
+  server.registerTool("photopea_export_artifacts", {
+    description: "Start one export and return its operation ID immediately. Use get_operation until completed. PSD preserves layers; raster formats flatten. Requires a NEW absolute output path; existing files are preserved. Binary transfer, SHA-256 and structural validation precede publication. Reopening is a separate editability check. Do not edit the UI during export. This milestone exports one artifact, not a variants bundle.",
+    inputSchema: { format: z.enum(["png", "jpg", "webp", "psd", "svg"]), outputPath: z.string(), quality: z.number().int().min(1).max(100).optional() },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  }, async params => {
+    try {
+      const operationId = bridge.startExport(buildExportImage(params), params.outputPath, params.format);
+      return { content: [{ type: "text", text: JSON.stringify({ operationId, state: "queued_or_running" }) }] };
+    } catch (e) { return { isError: true, content: [{ type: "text", text: (e as Error).message }] }; }
+  });
   // 30. photopea_export_image
   server.registerTool("photopea_export_image", {
     title: "Export Image",
-    description: "Export the active document to a file and save it to the local filesystem. The entire document is flattened and exported in the chosen format. Use create_document or open_file to set up the document before exporting.",
+    description: "Export the active document to a NEW local path with binary transfer, checksum and structural validation. PSD preserves layers; raster formats flatten. Existing files are never replaced. For long PSD exports prefer export_artifacts and poll get_operation. Reopen separately to check editability; avoid manual UI edits during export.",
     inputSchema: {
       format: z.enum(["png", "jpg", "webp", "psd", "svg"]).describe("Output format: 'png' for lossless, 'jpg' for compressed photos, 'webp' for web, 'psd' for Photoshop, 'svg' for vector"),
       quality: z.number().min(1).max(100).optional().describe("Compression quality for JPG format only (1 = smallest file, 100 = best quality). Ignored for other formats."),
@@ -25,17 +52,12 @@ export function registerExportTools(server: McpServer, bridge: PhotopeaBridge): 
   }, async (params) => {
     const script = buildExportImage(params);
     bridge.sendActivity({ type: "activity", id: "", tool: "export_image", summary: `Export as ${params.format} to ${params.outputPath}` });
-    const rawResult = await bridge.executeScript(script, true);
-    if (!rawResult.success) return { isError: true, content: [{ type: "text" as const, text: rawResult.error || "Failed to export image" }] };
+    let rawResult;
+    try { rawResult = await bridge.exportToFile(script, params.outputPath, params.format); }
+    catch (e) { return { isError: true, content: [{ type: "text" as const, text: (e as Error).message }] }; }
+    if (!rawResult.success) return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(rawResult) }] };
 
-    const fileResult = rawResult as BridgeFileResult;
-    try {
-      await writeLocalFile(params.outputPath, fileResult.data);
-    } catch (err) {
-      return { isError: true, content: [{ type: "text" as const, text: `Export succeeded but failed to write file: ${(err as Error).message}` }] };
-    }
-
-    return { content: [{ type: "text" as const, text: `Image exported to: ${params.outputPath}` }] };
+    return { content: [{ type: "text" as const, text: JSON.stringify(rawResult) }] };
   });
 
   // photopea_load_font
@@ -47,15 +69,10 @@ export function registerExportTools(server: McpServer, bridge: PhotopeaBridge): 
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async (params) => {
-    // Loading a font via app.open() opens it as a "document" -- we need to track the current doc and switch back
-    const script = [
-      `var _docName = app.activeDocument ? app.activeDocument.name : null;`,
-      `app.open('${params.url.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');`,
-      `if (_docName) { app.activeDocument = app.documents.getByName(_docName); }`,
-      `app.echoToOE('ok');`,
-    ].join("\n");
     bridge.sendActivity({ type: "activity", id: "", tool: "load_font", summary: `Load font: ${params.url.split("/").pop()}` });
-    const result = await bridge.executeScript(script);
+    let result;
+    try { result = await bridge.loadFile(await fetchUrlToBuffer(params.url), "font"); }
+    catch (e) { return { isError: true, content: [{ type: "text" as const, text: (e as Error).message }] }; }
     if (!result.success) return { isError: true, content: [{ type: "text" as const, text: result.error || "Failed to load font" }] };
     return { content: [{ type: "text" as const, text: `Font loaded from: ${params.url}. Use list_fonts to find its PostScript name.` }] };
   });
@@ -71,7 +88,7 @@ export function registerExportTools(server: McpServer, bridge: PhotopeaBridge): 
   }, async (params) => {
     const search = params.search?.toLowerCase();
     const script = search
-      ? `var r=[];for(var i=0;i<app.fonts.length;i++){var n=app.fonts[i].postScriptName;if(n.toLowerCase().indexOf('${search}')>=0)r.push(n);}app.echoToOE(JSON.stringify(r));`
+      ? `var r=[];for(var i=0;i<app.fonts.length;i++){var n=app.fonts[i].postScriptName;if(n.toLowerCase().indexOf(${JSON.stringify(search)})>=0)r.push(n);}app.echoToOE(JSON.stringify(r));`
       : `var r=[];for(var i=0;i<app.fonts.length;i++){r.push(app.fonts[i].postScriptName);}app.echoToOE(JSON.stringify(r));`;
     bridge.sendActivity({ type: "activity", id: "", tool: "list_fonts", summary: `List fonts${search ? `: ${search}` : ""}` });
     const result = await bridge.executeScript(script);
@@ -83,7 +100,7 @@ export function registerExportTools(server: McpServer, bridge: PhotopeaBridge): 
   // 33. photopea_run_script
   server.registerTool("photopea_run_script", {
     title: "Run Script",
-    description: "Execute arbitrary Photopea/ExtendScript JavaScript in the Photopea environment. Use this for advanced operations not covered by other tools. Has full access to the Photopea DOM (app, activeDocument, layers). Use with caution — scripts can modify or delete any document data.",
+    description: "Execute synchronous Photopea/ExtendScript JavaScript. Has full access to the DOM and can delete document data. Asynchronous app.open(URL), dialogs, and arbitrary postMessage exports are unsupported: use open_file and export_artifacts. A timeout retains editor ownership; query its operation ID instead of replaying mutations.",
     inputSchema: {
       script: z.string().describe("Photopea JavaScript code to execute. Must call app.echoToOE(result) to return data. Has access to the full Photopea scripting API (app, activeDocument, etc.)."),
     },

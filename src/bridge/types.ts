@@ -1,84 +1,41 @@
-// src/bridge/types.ts
-
-// --- WebSocket Protocol Messages ---
-
-/** Server -> Client: execute a Photopea script */
-export interface ExecuteMessage {
-  id: string;
-  type: "execute";
-  script: string;
-  expectFiles: boolean;
-}
-
-/** Server -> Client: load a binary file into Photopea */
-export interface LoadMessage {
-  id: string;
-  type: "load";
-  data: string; // base64-encoded
-  filename: string;
-}
-
-export type ServerToClientMessage = ExecuteMessage | LoadMessage;
-
-/** Client -> Server: script execution result */
-export interface ResultMessage {
-  id: string;
-  type: "result";
-  success: boolean;
-  data: string | null;
-  error: string | null;
-}
-
-/** Client -> Server: file data from export */
-export interface FileMessage {
-  id: string;
-  type: "file";
-  success: boolean;
-  data: string; // base64-encoded
-  mimeType: string;
-  error: string | null;
-}
-
-/** Client -> Server: status update */
-export interface StatusMessage {
-  type: "status";
-  status: "ready" | "disconnected";
-}
-
-/** Client -> Server: activity log entry for the frontend */
-export interface ActivityMessage {
-  type: "activity";
-  id: string;
-  tool: string;
-  summary: string;
-}
-
+// JSON control protocol v2. Binary frames carry sequence (u32 BE), offset (u32 BE), then <=1 MiB bytes.
+export interface Envelope { sessionId: string; epoch: string }
+export interface ActivityMessage { type: "activity"; id: string; tool: string; summary: string }
+export type ServerToClientMessage = Envelope & (
+  | { type: "welcome"; protocol: 2; activeId: string | null }
+  | { type: "execute"; id: string; script: string; expectFiles: boolean }
+  | { type: "load_begin"; id: string; filename: string; byteLength: number; sha256: string }
+  | { type: "load_end"; id: string }
+  | { type: "file_ack"; id: string; offset: number }
+  | { type: "transfer_error"; id: string; error: string }
+  | { type: "settled"; id: string }
+  | ActivityMessage
+);
 export type ClientToServerMessage =
-  | ResultMessage
-  | FileMessage
-  | StatusMessage;
-
-// --- Bridge Internal Types ---
-
+  | { type: "hello"; protocol: 2; token: string; sessionId: string; ready: boolean }
+  | (Envelope & (
+    | { type: "status"; ready: boolean }
+    | { type: "result"; id: string; success: boolean; data: string | null; error: string | null }
+    | { type: "file_begin"; id: string; byteLength: number; sha256: string }
+    | { type: "file_end"; id: string }
+    | { type: "load_ack"; id: string; offset: number }
+  ));
 export interface BridgeResult {
   success: boolean;
   data: string | null;
   error: string | null;
-}
-
-export interface BridgeFileResult {
-  success: boolean;
-  data: Buffer;
-  mimeType: string;
-  error: string | null;
-}
-
-export interface PendingRequest {
-  id: string;
-  resolve: (value: BridgeResult | BridgeFileResult) => void;
-  reject: (reason: Error) => void;
-  expectFiles: boolean;
-  timer: ReturnType<typeof setTimeout>;
+  operationId?: string;
+  state?: string;
+  artifact?: {
+    path: string;
+    byteLength: number;
+    sha256: string;
+    format: string;
+    validation: "structure_checked";
+    width?: number;
+    height?: number;
+    layerCount?: number;
+  };
 }
 
 // --- Tool Parameter Types ---

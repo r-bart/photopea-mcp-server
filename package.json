@@ -1,17 +1,17 @@
 {
   "name": "photopea-mcp-server",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "MCP server for AI-driven image editing with Photopea",
   "author": "attalla1",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/attalla1/photopea-mcp-server.git"
+    "url": "git+https://github.com/r-bart/photopea-mcp-server.git"
   },
   "bugs": {
-    "url": "https://github.com/attalla1/photopea-mcp-server/issues"
+    "url": "https://github.com/r-bart/photopea-mcp-server/issues"
   },
-  "homepage": "https://github.com/attalla1/photopea-mcp-server#readme",
+  "homepage": "https://github.com/r-bart/photopea-mcp-server#readme",
   "keywords": [
     "modelcontextprotocol",
     "mcp",
@@ -25,7 +25,8 @@
     "dist",
     "src/frontend",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHECKPOINTS.md"
   ],
   "bin": {
     "photopea-mcp-server": "dist/index.js"
@@ -38,15 +39,16 @@
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "vitest run --config vitest.e2e.config.ts"
+    "test:e2e": "tsx tests/e2e/isolated.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.tests.json && node --check src/frontend/client.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
     "open": "^10.1.0",
-    "ws": "^8.18.0",
+    "ws": "^8.22.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
