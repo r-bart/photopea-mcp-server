@@ -136,4 +136,30 @@ describe("PhotopeaBridge", () => {
   it("reports ready state", () => {
     expect(bridge.isReady()).toBe(true);
   });
+
+  it("rejects a second tab without replacing the active document session", async () => {
+    const executed = new Promise<Record<string, unknown>>((resolve) => {
+      clientWs.once("message", (raw) => resolve(JSON.parse(raw.toString())));
+    });
+    const resultPromise = bridge.executeScript("keepExistingDocument();");
+    const message = await executed;
+    const second = new WebSocket(`ws://127.0.0.1:${TEST_PORT}`);
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      second.once("close", (code, reason) => resolve({ code, reason: reason.toString() }));
+    });
+    try {
+      await new Promise<void>((resolve) => second.once("open", resolve));
+      const rejection = await Promise.race([
+        closed,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 150)),
+      ]);
+      expect(rejection).toEqual({ code: 1008, reason: "Another Photopea session is already connected" });
+      expect(clientWs.readyState).toBe(WebSocket.OPEN);
+      clientWs.send(JSON.stringify({ id: message.id, type: "result", success: true, data: "original session", error: null }));
+      expect(await resultPromise).toMatchObject({ success: true, data: "original session" });
+      expect(bridge.isReady()).toBe(true);
+    } finally {
+      second.terminate();
+    }
+  });
 });
