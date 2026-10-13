@@ -145,7 +145,8 @@
       if (pending.file) pending.error = 'Multiple exports are unsupported in one operation';
       else pending.file = data;
     } else if (typeof data === 'string') {
-      if (data === '__mcp_begin:' + pending.id) { pending.began = true; log('execution', 'Begin received', false); }
+      if (data.startsWith('__mcp_progress:')) { log('workflow',data.slice('__mcp_progress:'.length),false); }
+      else if (data === '__mcp_begin:' + pending.id) { pending.began = true; log('execution', 'Begin received', false); }
       else if (data === '__mcp_end:' + pending.id) { pending.ended = true; log('execution', 'End received', false); }
       else if (data.startsWith('__mcp_error:' + pending.id + ':')) pending.error = data.slice(('__mcp_error:' + pending.id + ':').length);
       else if (data === 'done') {

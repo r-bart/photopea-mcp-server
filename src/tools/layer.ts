@@ -3,6 +3,8 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { PhotopeaBridge } from "../bridge/websocket-server.js";
 import type { BridgeResult } from "../bridge/types.js";
+import type { EditorSession } from '../livery/session.js';
+import { selectorSchema } from './livery.js';
 import {
   buildAddLayer,
   buildAddFillLayer,
@@ -13,13 +15,12 @@ import {
   buildDuplicateLayer,
   buildReorderLayer,
   buildGroupLayers,
-  buildGetLayers,
   escapeString,
 } from "../bridge/script-builder.js";
 
 const layerTarget = z.union([z.string(), z.number()]).describe("Layer name (string) or index (number)");
 
-export function registerLayerTools(server: McpServer, bridge: PhotopeaBridge): void {
+export function registerLayerTools(server: McpServer, bridge: PhotopeaBridge,session:EditorSession): void {
   // 6. photopea_add_layer
   server.registerTool("photopea_add_layer", {
     title: "Add Layer",
@@ -204,15 +205,15 @@ export function registerLayerTools(server: McpServer, bridge: PhotopeaBridge): v
   // 15. photopea_get_layers
   server.registerTool("photopea_get_layers", {
     title: "Get Layers",
-    description: "Get the full layer tree of the active document as JSON. Returns an array of layer objects with name, type, index, visible, opacity, blendMode, and bounds properties. Groups contain nested children arrays. Use this to discover layer names and indices for other layer operations.",
-    inputSchema: {},
+    description: "Inspect an explicit document (or unambiguous active document), returning structural selectors, parent paths, own/effective visibility and finite bounds. Flat layer records retain hierarchy through paths. Use parent/depth/offset/limit for large templates; hasMore indicates another page. Names can repeat; selectors are checked against the complete hierarchy before mutation.",
+    inputSchema: {document:z.string().uuid().optional(),parent:selectorSchema.optional(),depth:z.number().int().min(1).max(64).default(3),offset:z.number().int().min(0).max(2048).default(0),limit:z.number().int().min(1).max(128).default(128)},
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  }, async (_params) => {
-    const script = buildGetLayers();
-    bridge.sendActivity({ type: "activity", id: "", tool: "get_layers", summary: "Get layer tree" });
-    const result = await bridge.executeScript(script);
-    if (!result.success) return { isError: true, content: [{ type: "text" as const, text: result.error || "Failed to get layers" }] };
-    const layersResult = result as BridgeResult;
-    return { content: [{ type: "text" as const, text: layersResult.data || "[]" }] };
+  }, async (params) => {
+    const result = await bridge.runWorkflow(async()=>{
+      const ref=params.document??await session.activeReference();
+      const {structure,...query}=await session.getLayers(ref,params);
+      return {success:true,data:JSON.stringify(query),error:null};
+    });
+    return {isError:!result.success,content:[{type:'text' as const,text:JSON.stringify(result)}]};
   });
 }

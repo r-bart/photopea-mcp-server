@@ -2,7 +2,8 @@ import { createServer, type Server as HttpServer } from "node:http";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { randomUUID, createHash } from "node:crypto";
 import { Script } from "node:vm";
-import { OperationManager } from "./operation-manager.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { OperationManager, type OperationSnapshot } from "./operation-manager.js";
 import { OperationJournal } from "./operation-journal.js";
 import { ArtifactWriter, CHUNK_BYTES, MAX_FILE_BYTES, type ExportFormat } from "../utils/artifacts.js";
 import type { ActivityMessage, BridgeResult } from "./types.js";
@@ -12,11 +13,15 @@ import { VERSION } from "../version.js";
 export const PROTOCOL_VERSION = 2;
 export interface BridgeOptions { queueMs?: number; scriptMs?: number; exportMs?: number; stallMs?: number; readyMs?: number; autoLaunch?: boolean; journalDirectory?: string }
 interface Transfer { writer: ArtifactWriter; offset: number; sequence: number }
+interface WorkflowContext { id:string; abandoned?:BridgeResult }
 
 export class PhotopeaBridge {
   readonly httpServer: HttpServer = createServer();
   readonly wss: WebSocketServer;
   readonly operations: OperationManager;
+  private readonly workflows: OperationManager;
+  private readonly workflowScope = new AsyncLocalStorage<WorkflowContext>();
+  private readonly contexts = new Map<string,WorkflowContext>();
   private client: WebSocket | null = null;
   private sessionId?: string;
   private epoch?: string;
@@ -36,7 +41,8 @@ export class PhotopeaBridge {
   constructor(private port: number, options: BridgeOptions = {}) {
     this.options = { queueMs: 120_000, scriptMs: 30_000, exportMs: 180_000, stallMs: 30_000, readyMs: 60_000, autoLaunch: true, ...options };
     if (options.journalDirectory) this.journal = new OperationJournal(options.journalDirectory);
-    this.operations = new OperationManager(this.options.queueMs, 16, 256, snapshot => this.journal?.record(snapshot));
+    this.workflows = new OperationManager(this.options.queueMs, 16, 256, snapshot => this.journal?.record(snapshot));
+    this.operations = new OperationManager(this.options.queueMs, 16, 256, snapshot => this.recordStep(snapshot));
     this.wss = new WebSocketServer({ server: this.httpServer, maxPayload: CHUNK_BYTES + 8, perMessageDeflate: false });
     this.wss.on("connection", (ws, request) => {
       if (request.headers.host !== `127.0.0.1:${this.port}` || request.url !== "/" || (request.headers.origin && request.headers.origin !== `http://127.0.0.1:${this.port}`)) {
@@ -82,9 +88,51 @@ export class PhotopeaBridge {
   getPort(): number { return this.port; }
   getLaunchUrl(): string { return `http://127.0.0.1:${this.port}/#token=${this.token}`; }
   isReady(): boolean { return !this.stopped && this.client?.readyState === WebSocket.OPEN && this.ready; }
-  getStatus() { return { version: VERSION, protocol: PROTOCOL_VERSION, sessionId: this.sessionId, ready: this.isReady(), activeOperation: this.operations.activeId ? this.operations.snapshot(this.operations.activeId) : null, queued: this.operations.queuedCount }; }
-  getOperation(id: string) { return this.operations.snapshot(id); }
-  cancelOperation(id: string): string { return this.operations.cancel(id); }
+  getStatus() { return { version: VERSION, protocol: PROTOCOL_VERSION, sessionId: this.sessionId, ready: this.isReady(), activeOperation: this.workflows.activeId ? this.workflows.snapshot(this.workflows.activeId) : null, activeStep: this.operations.activeId ? this.operations.snapshot(this.operations.activeId) : null, queued: this.workflows.queuedCount }; }
+  getOperation(id: string) { return this.workflows.snapshot(id) ?? this.operations.snapshot(id); }
+  cancelOperation(id: string): string { return this.workflows.snapshot(id) ? this.workflows.cancel(id) : this.operations.cancel(id); }
+  private recordStep(snapshot:OperationSnapshot):void {
+    this.journal?.record(snapshot);
+    const parent=snapshot.parentOperationId;
+    if(!parent||this.workflows.activeId!==parent)return;
+    if(snapshot.state==='running'||snapshot.state==='transferring'||snapshot.state==='persisting')this.workflows.phase(parent,snapshot.state,true);
+    if(snapshot.candidate)this.workflows.candidate(parent,snapshot.candidate);
+    if(snapshot.state==='indeterminate')this.workflows.markIndeterminate(snapshot.result?.error??'Child execution unknown');
+    const context=this.contexts.get(parent);
+    if(snapshot.finishedAt!==undefined&&context?.abandoned){
+      const root=this.workflows.snapshot(parent);
+      this.workflows.complete(parent,root?.kind==='workflow'?context.abandoned:(snapshot.result??context.abandoned));this.contexts.delete(parent);
+    }
+  }
+  currentWorkflowId():string|undefined{return this.workflowScope.getStore()?.id;}
+  canContinueWorkflow():boolean {
+    const id=this.currentWorkflowId();
+    return !this.stopped && (!id||this.workflows.snapshot(id)?.state!=='indeterminate') && (!this.operations.activeId||this.operations.snapshot(this.operations.activeId)?.state!=='indeterminate');
+  }
+  private assertWorkflowKnown():void { if(!this.canContinueWorkflow())throw new Error('Execution outcome unknown; inspect operation before another step'); }
+  startWorkflow(work:()=>Promise<BridgeResult>,kind:NonNullable<OperationSnapshot['kind']>='workflow'):string {
+    const job=this.workflows.enqueue(id=>{
+      const context:WorkflowContext={id};this.contexts.set(id,context);
+      void this.workflowScope.run(context,async()=>{
+        let result:BridgeResult;
+        try { result=await work(); }
+        catch(error){result={success:false,data:null,error:(error as Error).message};}
+        if(this.operations.activeId&&this.operations.snapshot(this.operations.activeId)?.state==='indeterminate'){
+          context.abandoned=result;
+          this.workflows.markIndeterminate(result.error??'Workflow has an unknown step',result);
+        }else{
+          this.workflows.complete(id,result);this.contexts.delete(id);this.pump();
+        }
+      });
+    },900_000,{kind});
+    this.ensureBrowser();this.pump();return job.operationId;
+  }
+  async runWorkflow(work:()=>Promise<BridgeResult>,kind:NonNullable<OperationSnapshot['kind']>='workflow'):Promise<BridgeResult>{
+    if(this.workflowScope.getStore()){this.assertWorkflowKnown();return work();}
+    await this.waitForReady();
+    const id=this.startWorkflow(work,kind);
+    while(true){const op=this.workflows.snapshot(id)!;if(op.result)return op.result;await new Promise(r=>setTimeout(r,20));}
+  }
 
   async waitForReady(): Promise<void> {
     if (this.stopped) throw new Error("Bridge stopped");
@@ -103,7 +151,11 @@ export class PhotopeaBridge {
     launchBrowser(this.getLaunchUrl()).catch(() => console.error("Could not launch Photopea bridge browser"));
   }
   async start(): Promise<void> {
-    if (this.journal) this.operations.restore(await this.journal.load());
+    if (this.journal) {
+      const recovered=await this.journal.load();
+      this.workflows.restore(recovered.filter(x=>x.kind&&x.kind!=='step'));
+      this.operations.restore(recovered.filter(x=>!x.kind||x.kind==='step'));
+    }
     await new Promise<void>((resolve, reject) => {
       this.httpServer.once("error", reject);
       this.httpServer.listen(this.port, "127.0.0.1", () => {
@@ -115,7 +167,7 @@ export class PhotopeaBridge {
   }
   async stop(): Promise<void> {
     if (this.stopped) return;
-    this.stopped = true; this.operations.stop();
+    this.stopped = true; this.workflows.stop(); this.operations.stop();
     this.loadAck?.reject(new Error("Bridge stopped"));
     for (const ws of this.wss.clients) ws.terminate();
     this.client = null; this.ready = false;
@@ -130,20 +182,27 @@ export class PhotopeaBridge {
   private send(message: object): void {
     if (this.client?.readyState === WebSocket.OPEN) this.client.send(JSON.stringify({ ...message, sessionId: this.sessionId, epoch: this.epoch }));
   }
-  private pump(): void { this.operations.pump(this.isReady()); }
+  private pump(): void { this.operations.pump(this.isReady());this.workflows.pump(this.isReady()); }
 
   async executeScript(script: string, expectFiles = false): Promise<BridgeResult> {
+    if(!this.workflowScope.getStore()){
+      try{return await this.runWorkflow(()=>this.executeScript(script,expectFiles),'command');}
+      catch(error){return {success:false,data:null,error:(error as Error).message};}
+    }
     if (expectFiles) return { success: false, data: null, error: "File exports require exportToFile/startExport with format and destination" };
     try {
+      this.assertWorkflowKnown();
       this.validateScript(script);
       await this.waitForReady();
-      const op = this.operations.enqueue(id => this.send({ type: "execute", id, script, expectFiles: false }), this.options.scriptMs);
+      const op = this.operations.enqueue(id => this.send({ type: "execute", id, script, expectFiles: false }), this.options.scriptMs,{kind:'step',parentOperationId:this.currentWorkflowId()});
       this.pump(); return await op.promise;
     } catch (error) { return { success: false, data: null, error: (error as Error).message }; }
   }
   startExport(script: string, path: string, format: ExportFormat): string {
+    if(!this.workflowScope.getStore())return this.startWorkflow(()=>this.exportToFile(script,path,format),'export');
+    this.assertWorkflowKnown();
     this.validateScript(script);
-    const op = this.operations.enqueue(id => this.send({ type: "execute", id, script, expectFiles: true }), this.options.exportMs);
+    const op = this.operations.enqueue(id => this.send({ type: "execute", id, script, expectFiles: true }), this.options.exportMs,{kind:'step',parentOperationId:this.currentWorkflowId()});
     this.exports.set(op.operationId, { path, format });
     void op.promise.then(result => { if (result.state !== "indeterminate") this.exports.delete(op.operationId); });
     this.ensureBrowser(); this.pump(); return op.operationId;
@@ -154,6 +213,8 @@ export class PhotopeaBridge {
     catch (error) { throw new Error(`Script syntax invalid; not started: ${(error as Error).message}`); }
   }
   async exportToFile(script: string, path: string, format: ExportFormat): Promise<BridgeResult> {
+    if(!this.workflowScope.getStore())return this.runWorkflow(()=>this.exportToFile(script,path,format),'export');
+    this.assertWorkflowKnown();
     await this.waitForReady();
     const id = this.startExport(script, path, format);
     while (true) {
@@ -163,6 +224,11 @@ export class PhotopeaBridge {
     }
   }
   async loadFile(data: Buffer, filename: string): Promise<BridgeResult> {
+    if(!this.workflowScope.getStore()){
+      try{return await this.runWorkflow(()=>this.loadFile(data,filename),'load');}
+      catch(error){return {success:false,data:null,error:(error as Error).message};}
+    }
+    this.assertWorkflowKnown();
     if (data.length > MAX_FILE_BYTES || !data.length) return { success: false, data: null, error: "Load exceeds file budget or is empty" };
     if (this.reservedLoadBytes + data.length > MAX_FILE_BYTES) return { success: false, data: null, error: "Outstanding loads exceed memory budget" };
     const length = data.length;
@@ -174,7 +240,7 @@ export class PhotopeaBridge {
       const op = this.operations.enqueue(id => {
         dispatched = true;
         void this.sendLoad(id, data, filename).catch(e => this.operations.markIndeterminate(`Load transfer: ${(e as Error).message}`)).finally(release);
-      }, this.options.exportMs);
+      }, this.options.exportMs,{kind:'step',parentOperationId:this.currentWorkflowId()});
       this.pump(); const result = await op.promise;
       if (!dispatched) release();
       return result;

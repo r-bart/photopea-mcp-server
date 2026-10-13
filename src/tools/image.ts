@@ -2,6 +2,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { PhotopeaBridge } from "../bridge/websocket-server.js";
+import type { LiveryWorkflows } from '../livery/workflows.js';
 import {
   buildApplyAdjustment,
   buildApplyFilter,
@@ -13,18 +14,19 @@ import {
   buildClearSelection,
   escapeString,
 } from "../bridge/script-builder.js";
-import { readLocalFile, fetchUrlToBuffer, isUrl } from "../utils/file-io.js";
 
 const layerTarget = z.union([z.string(), z.number()]).describe("Layer name (string) or index (number)");
 const hexColor = z.string().regex(/^#[0-9a-fA-F]{6}$/).describe("Color as hex string (e.g. #ff0000)");
 
-export function registerImageTools(server: McpServer, bridge: PhotopeaBridge): void {
+export function registerImageTools(server: McpServer, bridge: PhotopeaBridge,workflows:LiveryWorkflows): void {
   // 19. photopea_place_image
   server.registerTool("photopea_place_image", {
     title: "Place Image",
     description: "Place an image into the active document from a URL or local file path. Creates a new layer with the placed image as the active layer. Use width/height to resize while preserving aspect ratio, or x/y to position the layer.",
     inputSchema: {
       source: z.string().describe("URL or absolute local file path of the image to place"),
+      document:z.string().uuid().optional().describe('Explicit documentRef from list_documents'),
+      origin:z.enum(['canvas','content_bounds']).optional().describe('canvas preserves atlas margins; legacy default is content_bounds'),
       x: z.number().optional().describe("X position offset in pixels from the left edge"),
       y: z.number().optional().describe("Y position offset in pixels from the top edge"),
       width: z.number().positive().optional().describe("Resize to this width in pixels (preserves aspect ratio if only one dimension is set)"),
@@ -33,66 +35,9 @@ export function registerImageTools(server: McpServer, bridge: PhotopeaBridge): v
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   }, async (params) => {
-    const { source } = params;
-    bridge.sendActivity({ type: "activity", id: "", tool: "place_image", summary: `Place image: ${source}` });
-
-    // Step 1: Fetch the file data (server-side for both URLs and local files)
-    // This avoids Photopea's async app.open(url) which sends "done" before the file loads.
-    let fileData: Buffer;
-    try {
-      fileData = isUrl(source) ? await fetchUrlToBuffer(source) : await readLocalFile(source);
-    } catch (err) {
-      return { isError: true, content: [{ type: "text" as const, text: (err as Error).message }] };
-    }
-
-    // Step 2: Send ArrayBuffer to Photopea (opens as new document synchronously)
-    const filename = source.split("/").pop() || "image";
-    const loadResult = await bridge.loadFile(fileData, filename);
-    if (!loadResult.success) return { isError: true, content: [{ type: "text" as const, text: loadResult.error || "Failed to load image" }] };
-
-    // Step 3: Duplicate layer into target doc, close source, position in target
-    {
-      const lines = [
-        `var _srcDoc = app.activeDocument;`,
-        // Copy merged preserves transparency (unlike flatten/mergeVisible)
-        `_srcDoc.selection.selectAll();`,
-        `_srcDoc.selection.copy(true);`,
-        `_srcDoc.close(2);`,
-        `app.activeDocument.paste();`,
-      ];
-
-      const safeName = params.name ? escapeString(params.name) : "";
-      // Helper to extract numeric value from bounds (may be UnitValue objects or raw numbers)
-      lines.push(`function _bv(v) { return typeof v === 'object' && v !== null ? v.value || v.L || 0 : v; }`);
-      if (safeName) lines.push(`app.activeDocument.activeLayer.name = '${safeName}';`);
-      if (params.width || params.height) {
-        lines.push(`var _b = app.activeDocument.activeLayer.bounds;`);
-        lines.push(`var _cw = _bv(_b[2]) - _bv(_b[0]);`);
-        lines.push(`var _ch = _bv(_b[3]) - _bv(_b[1]);`);
-        if (params.width && params.height) {
-          // Fit within box, preserving aspect ratio
-          lines.push(`var _scale = Math.min(${params.width} / _cw, ${params.height} / _ch);`);
-        } else if (params.width) {
-          lines.push(`var _scale = ${params.width} / _cw;`);
-        } else {
-          lines.push(`var _scale = ${params.height} / _ch;`);
-        }
-        lines.push(`if (_cw > 0 && _ch > 0) { app.activeDocument.activeLayer.resize(_scale * 100, _scale * 100); }`);
-      }
-      if (params.x !== undefined || params.y !== undefined) {
-        const xPos = params.x ?? 0;
-        const yPos = params.y ?? 0;
-        lines.push(`var _b2 = app.activeDocument.activeLayer.bounds;`);
-        lines.push(`app.activeDocument.activeLayer.translate(${xPos} - _bv(_b2[0]), ${yPos} - _bv(_b2[1]));`);
-      }
-      lines.push(`app.echoToOE('ok');`);
-      const mergeResult = await bridge.executeScript(lines.join("\n"));
-      if (!mergeResult.success) return { isError: true, content: [{ type: "text" as const, text: mergeResult.error || "Failed to place image into document" }] };
-    }
-
-    return { content: [{ type: "text" as const, text: `Image placed: ${source}` }] };
+    const result = await workflows.importAsset({...params,origin:params.origin ?? 'content_bounds'});
+    return {isError:!result.success,content:[{type:'text' as const,text:JSON.stringify(result)}]};
   });
-
   // 20. photopea_apply_adjustment
   server.registerTool("photopea_apply_adjustment", {
     title: "Apply Adjustment",

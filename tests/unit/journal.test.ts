@@ -12,10 +12,12 @@ it('recovers published artifacts after a lost completion record, never replays r
     const id=randomUUID(),bytes=layeredPsd(),path=join(dir,'committed.psd'),sha256=createHash('sha256').update(bytes).digest('hex');
     journal.record({operationId:id,state:'persisting',createdAt:Date.now(),candidate:{path,byteLength:bytes.length,sha256,format:'psd'}});
     const unknown=randomUUID();journal.record({operationId:unknown,state:'running',createdAt:Date.now()});await journal.flush();
+    const workflow=randomUUID();journal.record({operationId:workflow,kind:'workflow',state:'persisting',createdAt:Date.now(),candidate:{path,byteLength:bytes.length,sha256,format:'psd'}});await journal.flush();
     await writeFile(path,bytes);
     const recovered=await new OperationJournal(join(dir,'operations')).load();
     expect(recovered.find(x=>x.operationId===id)).toMatchObject({state:'completed',result:{success:true,artifact:{sha256,layerCount:3}}});
     expect(recovered.find(x=>x.operationId===unknown)).toMatchObject({state:'indeterminate',result:{success:false}});
+    expect(recovered.find(x=>x.operationId===workflow)).toMatchObject({state:'indeterminate',result:{success:false}});
   }finally{await rm(dir,{recursive:true,force:true});}
 });
 it('marks restart-cancelled queues terminal and prunes completed history while keeping unknown outcomes',async()=>{
