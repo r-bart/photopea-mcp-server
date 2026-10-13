@@ -18,7 +18,7 @@ Rama: `codex/reliable-psd-checkpoints`. Base: `67057fc`. Resultado: READY FOR DR
 | Restart no repite; publicación previa se reconcilia | PASS | Diario candidato, hash/estructura y pruebas de recuperación |
 | Documento del usuario preservado | PASS por aislamiento | Solo puertos efímeros y fixtures propios; no se invocó MCP instalado ni se modificó su config |
 
-Pruebas: 73/73; typecheck de src/tests y sintaxis frontend; build correcto en Node 24.14.1 Windows. CI Windows/Linux Node 22/24 configurada, todavía no ejecutada aquí. Revisión architecture-checker: PASS tras corregir todos sus P1. No existe lint previo; no se afirma haberlo ejecutado.
+Pruebas: 73/73; typecheck de src/tests y sintaxis frontend; build correcto en Node 24.14.1 Windows. [CI del commit de implementación](https://github.com/r-bart/photopea-mcp-server/actions/runs/38460072921): PASS en Windows/Linux y Node 22/24. Revisión architecture-checker: PASS tras corregir todos sus P1. No existe lint previo; no se afirma haberlo ejecutado.
 
 Evidencia local completa: `output/isolated-514e2b15-41f9-4041-874f-d748f54f0b7d/evidence.json` (excluida de Git). Master sintético: 114.697.689 bytes, SHA-256 `071d27a780c175c8244e3cccc99bc9196f6d717c42ebdfddc3a9b9f970b1cd45`. Segundo PSD después del corte: 114.697.765 bytes. Se serializó de nuevo desde el documento reabierto y no se exige igualdad binaria entre dos guardados distintos; cada transferencia compara su checksum de origen/destino. El campo de tiempos del harness incluye otros exports/reapertura, no mide únicamente el serializador. RSS capturado: 425.132.032 bytes, no pico ni memoria del navegador.
 
