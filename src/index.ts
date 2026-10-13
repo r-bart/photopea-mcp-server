@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join, resolve } from "path";
+import { homedir } from "node:os";
 import { PhotopeaBridge } from "./bridge/websocket-server.js";
 import { createServer } from "./server.js";
 import { findAvailablePort } from "./utils/platform.js";
@@ -15,7 +16,7 @@ const DEFAULT_PORT = 4117;
 
 async function main(): Promise<void> {
   const port = await findAvailablePort(DEFAULT_PORT);
-  const bridge = new PhotopeaBridge(port);
+  const bridge = new PhotopeaBridge(port, { journalDirectory: join(homedir(), ".photopea-mcp", "operations") });
 
   // Serve the frontend HTML on HTTP GET /
   const httpServer = bridge.getHttpServer();
@@ -28,8 +29,13 @@ async function main(): Promise<void> {
   );
 
   httpServer.on("request", (req, res) => {
+    if (req.method === "GET" && req.url === "/client.js") {
+      res.writeHead(200, { "Content-Type": "text/javascript", "Cache-Control": "no-store" });
+      res.end(readFileSync(join(projectRoot, "src", "frontend", "client.js"), "utf-8"));
+      return;
+    }
     if (req.method === "GET" && (req.url === "/" || req.url === "/index.html")) {
-      res.writeHead(200, { "Content-Type": "text/html" });
+      res.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
       res.end(frontendHtml);
       return;
     }

@@ -1,390 +1,271 @@
-// src/bridge/websocket-server.ts
-
-import { createServer, type Server as HttpServer } from "http";
-import { WebSocketServer, WebSocket } from "ws";
-import { randomUUID } from "crypto";
-import type {
-  ActivityMessage,
-  BridgeResult,
-  BridgeFileResult,
-  ExecuteMessage,
-  LoadMessage,
-  PendingRequest,
-} from "./types.js";
+import { createServer, type Server as HttpServer } from "node:http";
+import { WebSocketServer, WebSocket, type RawData } from "ws";
+import { randomUUID, createHash } from "node:crypto";
+import { Script } from "node:vm";
+import { OperationManager } from "./operation-manager.js";
+import { OperationJournal } from "./operation-journal.js";
+import { ArtifactWriter, CHUNK_BYTES, MAX_FILE_BYTES, type ExportFormat } from "../utils/artifacts.js";
+import type { ActivityMessage, BridgeResult } from "./types.js";
 import { launchBrowser } from "../utils/platform.js";
+import { VERSION } from "../version.js";
 
-const DEFAULT_TIMEOUT_MS = 30_000;
-const EXPORT_TIMEOUT_MS = 60_000;
-const READY_TIMEOUT_MS = 60_000;
+export const PROTOCOL_VERSION = 2;
+export interface BridgeOptions { queueMs?: number; scriptMs?: number; exportMs?: number; stallMs?: number; readyMs?: number; autoLaunch?: boolean; journalDirectory?: string }
+interface Transfer { writer: ArtifactWriter; offset: number; sequence: number }
 
 export class PhotopeaBridge {
-  public readonly httpServer: HttpServer;
-  public readonly wss: WebSocketServer;
+  readonly httpServer: HttpServer = createServer();
+  readonly wss: WebSocketServer;
+  readonly operations: OperationManager;
   private client: WebSocket | null = null;
-  private ready: boolean = false;
-  private queue: PendingRequest[] = [];
-  private processing: boolean = false;
-  private pendingScripts: Map<string, string> = new Map();
-  private pendingLoads: Map<string, string> = new Map(); // id -> serialized LoadMessage JSON
-  private port: number;
-  private browserLaunched: boolean = false;
+  private sessionId?: string;
+  private epoch?: string;
+  private ready = false;
+  private browserLaunched = false;
+  private stopped = false;
+  private readonly token = randomUUID();
+  private readonly options: Required<Omit<BridgeOptions, "journalDirectory">>;
+  private readonly journal?: OperationJournal;
+  private exports = new Map<string, { path: string; format: ExportFormat }>();
+  private transfer?: Transfer;
+  private stallTimer?: ReturnType<typeof setTimeout>;
+  private incoming: Promise<void> = Promise.resolve();
+  private loadAck?: { offset: number; resolve: () => void; reject: (e: Error) => void };
+  private reservedLoadBytes = 0;
 
-  constructor(port: number) {
-    this.port = port;
-
-    // Create bare HTTP server; route handling is added externally via the entry point
-    this.httpServer = createServer();
-
-    // Create WSS attached directly to the HTTP server (not noServer mode)
-    this.wss = new WebSocketServer({ server: this.httpServer });
-
-    this.wss.on("connection", (ws: WebSocket) => {
-      // A new tab has a different document session and cannot own in-flight work.
-      if (this.client && this.client.readyState === WebSocket.OPEN) {
-        ws.close(1008, "Another Photopea session is already connected");
-        return;
+  constructor(private port: number, options: BridgeOptions = {}) {
+    this.options = { queueMs: 120_000, scriptMs: 30_000, exportMs: 180_000, stallMs: 30_000, readyMs: 60_000, autoLaunch: true, ...options };
+    if (options.journalDirectory) this.journal = new OperationJournal(options.journalDirectory);
+    this.operations = new OperationManager(this.options.queueMs, 16, 256, snapshot => this.journal?.record(snapshot));
+    this.wss = new WebSocketServer({ server: this.httpServer, maxPayload: CHUNK_BYTES + 8, perMessageDeflate: false });
+    this.wss.on("connection", (ws, request) => {
+      if (request.headers.host !== `127.0.0.1:${this.port}` || request.url !== "/" || (request.headers.origin && request.headers.origin !== `http://127.0.0.1:${this.port}`)) {
+        ws.close(1008, "Invalid bridge origin"); return;
       }
-      if (this.client) {
-        this.rejectAllPending(new Error("Photopea session replaced after disconnect; inspect document before retrying"));
-      }
-      this.client = ws;
-      this.ready = false;
-
-      ws.on("message", (raw) => {
+      let authenticated = false;
+      const helloTimer = setTimeout(() => ws.close(1008, "Handshake required"), 5000);
+      ws.on("message", (raw, binary) => {
+        if (!authenticated) {
+          if (binary) { ws.close(1008, "Handshake required"); return; }
+          let m: Record<string, unknown>;
+          try { m = JSON.parse(raw.toString()); } catch { ws.close(1008, "Invalid handshake"); return; }
+          if (!m || m.type !== "hello" || m.protocol !== PROTOCOL_VERSION || m.token !== this.token || typeof m.sessionId !== "string" || !/^[a-f0-9-]{36}$/.test(m.sessionId) || typeof m.ready !== "boolean") {
+            ws.close(1008, "Invalid handshake"); return;
+          }
+          if ((this.client && this.client.readyState === WebSocket.OPEN) || (this.sessionId && this.sessionId !== m.sessionId)) {
+            ws.close(1008, "Another Photopea session owns this bridge"); return;
+          }
+          authenticated = true; clearTimeout(helloTimer);
+          this.client = ws; this.sessionId = m.sessionId; this.epoch = randomUUID(); this.ready = m.ready;
+          this.send({ type: "welcome", protocol: PROTOCOL_VERSION, activeId: this.operations.activeId ?? null });
+          this.pump(); return;
+        }
         if (this.client !== ws) return;
-        try {
-          const msg = JSON.parse(raw.toString());
-          this.handleClientMessage(msg);
-        } catch {
-          // Ignore malformed messages
-        }
+        this.incoming = this.incoming.then(() => this.handle(raw, binary)).catch(async error => {
+          this.operations.markIndeterminate(`Protocol/IO failure: ${(error as Error).message}; editor ownership retained`);
+          await this.discardTransfer();
+          this.send({ type: "transfer_error", id: this.operations.activeId, error: (error as Error).message });
+        });
       });
-
       ws.on("close", () => {
-        // Only reset state if THIS ws is still the active client
-        if (this.client === ws) {
-          this.client = null;
-          this.ready = false;
-          this.rejectAllPending(new Error("Photopea client disconnected"));
-        }
+        clearTimeout(helloTimer);
+        if (this.client !== ws) return;
+        this.client = null; this.ready = false;
+        this.operations.markIndeterminate("Photopea disconnected; editor ownership retained");
+        this.loadAck?.reject(new Error("Disconnected during load transfer"));
+        this.incoming = this.incoming.then(() => this.discardTransfer());
       });
-
-      ws.on("error", () => {
-        // Error is followed by close; handled there
-      });
+      ws.on("error", () => {});
     });
   }
+  getHttpServer(): HttpServer { return this.httpServer; }
+  getPort(): number { return this.port; }
+  getLaunchUrl(): string { return `http://127.0.0.1:${this.port}/#token=${this.token}`; }
+  isReady(): boolean { return !this.stopped && this.client?.readyState === WebSocket.OPEN && this.ready; }
+  getStatus() { return { version: VERSION, protocol: PROTOCOL_VERSION, sessionId: this.sessionId, ready: this.isReady(), activeOperation: this.operations.activeId ? this.operations.snapshot(this.operations.activeId) : null, queued: this.operations.queuedCount }; }
+  getOperation(id: string) { return this.operations.snapshot(id); }
+  cancelOperation(id: string): string { return this.operations.cancel(id); }
 
-  // ---------------------------------------------------------------------------
-  // Public accessors
-  // ---------------------------------------------------------------------------
-
-  getHttpServer(): HttpServer {
-    return this.httpServer;
-  }
-
-  getPort(): number {
-    return this.port;
-  }
-
-  isReady(): boolean {
-    return this.client !== null && this.ready;
-  }
-
-  /** Wait for the bridge to become ready (Photopea loaded + WS connected). Launches browser on first call. */
-  waitForReady(): Promise<void> {
-    if (this.isReady()) return Promise.resolve();
-
-    // Lazy-launch browser on first tool call
-    if (!this.browserLaunched) {
-      this.browserLaunched = true;
-      const url = `http://127.0.0.1:${this.port}`;
-      console.error(`Launching browser: ${url}`);
-      launchBrowser(url).catch(() => {
-        console.error(`Could not auto-launch browser. Please open ${url}`);
-      });
+  async waitForReady(): Promise<void> {
+    if (this.stopped) throw new Error("Bridge stopped");
+    if (this.isReady()) return;
+    this.ensureBrowser();
+    const deadline = Date.now() + this.options.readyMs;
+    while (!this.isReady()) {
+      if (this.stopped) throw new Error("Bridge stopped");
+      if (Date.now() >= deadline) throw new Error("Photopea readiness deadline exceeded; operation not started");
+      await new Promise(r => setTimeout(r, Math.min(50, this.options.readyMs)));
     }
-
-    return new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        settled = true;
-        reject(new Error(`Photopea did not become ready within ${READY_TIMEOUT_MS / 1000}s. Please open http://127.0.0.1:${this.port} and wait for Photopea to load.`));
-      }, READY_TIMEOUT_MS);
-      const check = () => {
-        if (settled) return;
-        if (this.isReady()) {
-          clearTimeout(timer);
-          resolve();
-        } else {
-          setTimeout(check, 200);
-        }
-      };
-      check();
-    });
   }
-
-  // ---------------------------------------------------------------------------
-  // Lifecycle
-  // ---------------------------------------------------------------------------
-
-  start(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.httpServer.listen(this.port, "127.0.0.1", () => resolve());
+  private ensureBrowser(): void {
+    if (this.browserLaunched || !this.options.autoLaunch) return;
+    this.browserLaunched = true;
+    launchBrowser(this.getLaunchUrl()).catch(() => console.error("Could not launch Photopea bridge browser"));
+  }
+  async start(): Promise<void> {
+    if (this.journal) this.operations.restore(await this.journal.load());
+    await new Promise<void>((resolve, reject) => {
       this.httpServer.once("error", reject);
-    });
-  }
-
-  stop(): Promise<void> {
-    return new Promise((resolve) => {
-      this.rejectAllPending(new Error("Bridge stopped"));
-
-      // Close all WebSocket connections
-      for (const ws of this.wss.clients) {
-        ws.terminate();
-      }
-      this.client = null;
-      this.ready = false;
-
-      this.wss.close(() => {
-        this.httpServer.close(() => resolve());
+      this.httpServer.listen(this.port, "127.0.0.1", () => {
+        const addr = this.httpServer.address();
+        if (addr && typeof addr !== "string") this.port = addr.port;
+        this.httpServer.off("error", reject); resolve();
       });
     });
   }
-
-  // ---------------------------------------------------------------------------
-  // Outgoing helpers
-  // ---------------------------------------------------------------------------
-
-  sendActivity(activity: ActivityMessage): void {
-    if (this.client && this.client.readyState === WebSocket.OPEN) {
-      this.client.send(JSON.stringify(activity));
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Script execution
-  // ---------------------------------------------------------------------------
-
-  async executeScript(
-    script: string,
-    expectFiles = false
-  ): Promise<BridgeResult | BridgeFileResult> {
+  async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true; this.operations.stop();
+    this.loadAck?.reject(new Error("Bridge stopped"));
+    for (const ws of this.wss.clients) ws.terminate();
+    this.client = null; this.ready = false;
     try {
-      await this.waitForReady();
-    } catch (err) {
-      return { success: false, data: null, error: (err as Error).message };
+      await this.incoming; await this.discardTransfer();
+      await this.journal?.flush();
+    } finally {
+      await new Promise<void>(r => this.wss.close(() => this.httpServer.close(() => r())));
     }
-    if (!this.isReady()) {
-      return Promise.resolve<BridgeResult>({
-        success: false,
-        data: null,
-        error: "Photopea is not connected or not ready",
-      });
-    }
-
-    return new Promise<BridgeResult | BridgeFileResult>((resolve, reject) => {
-      const id = randomUUID();
-      const timeoutMs = expectFiles ? EXPORT_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
-
-      const timer = setTimeout(() => {
-        this.pendingScripts.delete(id);
-        const wasActive = this.queue[0]?.id === id;
-        this.queue = this.queue.filter((r) => r.id !== id);
-        if (wasActive) this.processing = false;
-        resolve({
-          success: false,
-          data: null,
-          error: `Script execution timed out after ${timeoutMs / 1000}s`,
-        });
-        if (wasActive) this.processNext();
-      }, timeoutMs);
-
-      const pending: PendingRequest = { id, resolve, reject, expectFiles, timer };
-
-      this.pendingScripts.set(id, script);
-      this.queue.push(pending);
-      this.processNext();
-    });
   }
+  sendActivity(activity: ActivityMessage): void { this.send(activity); }
+  private send(message: object): void {
+    if (this.client?.readyState === WebSocket.OPEN) this.client.send(JSON.stringify({ ...message, sessionId: this.sessionId, epoch: this.epoch }));
+  }
+  private pump(): void { this.operations.pump(this.isReady()); }
 
-  // ---------------------------------------------------------------------------
-  // File loading
-  // ---------------------------------------------------------------------------
-
+  async executeScript(script: string, expectFiles = false): Promise<BridgeResult> {
+    if (expectFiles) return { success: false, data: null, error: "File exports require exportToFile/startExport with format and destination" };
+    try {
+      this.validateScript(script);
+      await this.waitForReady();
+      const op = this.operations.enqueue(id => this.send({ type: "execute", id, script, expectFiles: false }), this.options.scriptMs);
+      this.pump(); return await op.promise;
+    } catch (error) { return { success: false, data: null, error: (error as Error).message }; }
+  }
+  startExport(script: string, path: string, format: ExportFormat): string {
+    this.validateScript(script);
+    const op = this.operations.enqueue(id => this.send({ type: "execute", id, script, expectFiles: true }), this.options.exportMs);
+    this.exports.set(op.operationId, { path, format });
+    void op.promise.then(result => { if (result.state !== "indeterminate") this.exports.delete(op.operationId); });
+    this.ensureBrowser(); this.pump(); return op.operationId;
+  }
+  private validateScript(script: string): void {
+    if (Buffer.byteLength(script) > 128 * 1024) throw new Error("Script exceeds control budget; not started");
+    try { new Script(script); }
+    catch (error) { throw new Error(`Script syntax invalid; not started: ${(error as Error).message}`); }
+  }
+  async exportToFile(script: string, path: string, format: ExportFormat): Promise<BridgeResult> {
+    await this.waitForReady();
+    const id = this.startExport(script, path, format);
+    while (true) {
+      const snapshot = this.operations.snapshot(id)!;
+      if (snapshot.result) return snapshot.result;
+      await new Promise(r => setTimeout(r, 20));
+    }
+  }
   async loadFile(data: Buffer, filename: string): Promise<BridgeResult> {
+    if (data.length > MAX_FILE_BYTES || !data.length) return { success: false, data: null, error: "Load exceeds file budget or is empty" };
+    if (this.reservedLoadBytes + data.length > MAX_FILE_BYTES) return { success: false, data: null, error: "Outstanding loads exceed memory budget" };
+    const length = data.length;
+    this.reservedLoadBytes += length;
+    let dispatched = false, released = false;
+    const release = () => { if (!released) { this.reservedLoadBytes -= length; released = true; } };
     try {
       await this.waitForReady();
-    } catch (err) {
-      return { success: false, data: null, error: (err as Error).message };
-    }
-    if (!this.isReady()) {
-      return { success: false, data: null, error: "Photopea is not connected or not ready" };
-    }
-
-    return new Promise<BridgeResult>((resolve) => {
-      const id = randomUUID();
-      const msg: LoadMessage = {
-        id,
-        type: "load",
-        data: data.toString("base64"),
-        filename,
-      };
-
-      const timer = setTimeout(() => {
-        this.pendingLoads.delete(id);
-        const wasActive = this.queue[0]?.id === id;
-        this.queue = this.queue.filter((r) => r.id !== id);
-        if (wasActive) this.processing = false;
-        resolve({
-          success: false,
-          data: null,
-          error: `loadFile timed out after ${DEFAULT_TIMEOUT_MS / 1000}s`,
-        });
-        if (wasActive) this.processNext();
-      }, DEFAULT_TIMEOUT_MS);
-
-      // Store the serialized load message so processNext can send it when the queue is free
-      this.pendingLoads.set(id, JSON.stringify(msg));
-
-      const pending: PendingRequest = {
-        id,
-        resolve: resolve as (v: BridgeResult | BridgeFileResult) => void,
-        reject: () => {},
-        expectFiles: false,
-        timer,
-      };
-
-      this.queue.push(pending);
-      this.processNext();
+      const op = this.operations.enqueue(id => {
+        dispatched = true;
+        void this.sendLoad(id, data, filename).catch(e => this.operations.markIndeterminate(`Load transfer: ${(e as Error).message}`)).finally(release);
+      }, this.options.exportMs);
+      this.pump(); const result = await op.promise;
+      if (!dispatched) release();
+      return result;
+    } catch (error) { release(); return { success: false, data: null, error: (error as Error).message }; }
+  }
+  private async sendLoad(id: string, data: Buffer, filename: string): Promise<void> {
+    const waitAck = (offset: number) => new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { this.loadAck = undefined; reject(new Error("Load ACK deadline exceeded")); }, this.options.stallMs);
+      this.loadAck = { offset, resolve: () => { clearTimeout(timer); this.loadAck = undefined; resolve(); }, reject: e => { clearTimeout(timer); this.loadAck = undefined; reject(e); } };
     });
+    let ack = waitAck(0);
+    this.send({ type: "load_begin", id, byteLength: data.length, filename, sha256: createHash("sha256").update(data).digest("hex") });
+    await ack;
+    for (let offset = 0, sequence = 0; offset < data.length; sequence++) {
+      const chunk = data.subarray(offset, Math.min(offset + CHUNK_BYTES, data.length));
+      const header = Buffer.alloc(8); header.writeUInt32BE(sequence, 0); header.writeUInt32BE(offset, 4);
+      ack = waitAck(offset + chunk.length);
+      if (!this.isReady()) { this.loadAck!.reject(new Error("Disconnected")); await ack; }
+      this.client!.send(Buffer.concat([header, chunk]));
+      await ack; offset += chunk.length;
+    }
+    this.send({ type: "load_end", id });
   }
-
-  // ---------------------------------------------------------------------------
-  // Internal queue processing
-  // ---------------------------------------------------------------------------
-
-  private processNext(): void {
-    if (this.processing || this.queue.length === 0 || !this.client) {
-      return;
-    }
-
-    const next = this.queue[0];
-
-    // Check if this is a queued load message
-    const loadMsg = this.pendingLoads.get(next.id);
-    if (loadMsg) {
-      this.pendingLoads.delete(next.id);
-      this.processing = true;
-      if (this.client.readyState === WebSocket.OPEN) {
-        this.client.send(loadMsg);
-      } else {
-        // Client gone; resolve with error and continue
-        clearTimeout(next.timer);
-        this.queue.shift();
-        this.processing = false;
-        next.resolve({ success: false, data: null, error: "WebSocket not open" });
-        this.processNext();
-      }
-      return;
-    }
-
-    const script = this.pendingScripts.get(next.id);
-
-    if (script === undefined) {
-      // Already handled (timeout/disconnect removed it)
-      this.queue.shift();
-      this.processNext();
-      return;
-    }
-
-    this.processing = true;
-
-    const msg: ExecuteMessage = {
-      id: next.id,
-      type: "execute",
-      script,
-      expectFiles: next.expectFiles,
-    };
-
-    if (this.client.readyState === WebSocket.OPEN) {
-      this.client.send(JSON.stringify(msg));
-    } else {
-      // Client gone; resolve with error and continue
-      clearTimeout(next.timer);
-      this.queue.shift();
-      this.pendingScripts.delete(next.id);
-      this.processing = false;
-      next.resolve({ success: false, data: null, error: "WebSocket not open" });
-      this.processNext();
-    }
+  private resetStall(): void {
+    clearTimeout(this.stallTimer);
+    this.stallTimer = setTimeout(() => {
+      this.operations.markIndeterminate("Transfer/persistence deadline exceeded; editor ownership retained");
+      this.incoming = this.incoming.then(() => this.discardTransfer());
+      this.send({ type: "transfer_error", id: this.operations.activeId, error: "Transfer deadline exceeded" });
+    }, this.options.stallMs);
   }
-
-  // ---------------------------------------------------------------------------
-  // Incoming message handler
-  // ---------------------------------------------------------------------------
-
-  private handleClientMessage(msg: Record<string, unknown>): void {
-    if (msg.type === "status") {
-      if (msg.status === "ready") {
-        this.ready = true;
-      }
+  private async discardTransfer(): Promise<void> {
+    clearTimeout(this.stallTimer);
+    const transfer = this.transfer; this.transfer = undefined;
+    await transfer?.writer.abort();
+  }
+  private async handle(raw: RawData, binary: boolean): Promise<void> {
+    if (binary) {
+      const b = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as ArrayBuffer);
+      const t = this.transfer;
+      if (!t || b.length <= 8 || b.readUInt32BE(0) !== t.sequence || b.readUInt32BE(4) !== t.offset) throw new Error("Unexpected binary chunk");
+      await t.writer.append(t.offset, b.subarray(8));
+      t.offset += b.length - 8; t.sequence++;
+      this.resetStall(); this.send({ type: "file_ack", id: this.operations.activeId, offset: t.offset }); return;
+    }
+    if (raw.toString().length > 256 * 1024) throw new Error("Control message exceeds budget");
+    const m = JSON.parse(raw.toString());
+    if (!m || m.sessionId !== this.sessionId || m.epoch !== this.epoch) return;
+    if (m.type === "status") {
+      if (typeof m.ready !== "boolean") throw new Error("Invalid readiness message");
+      this.ready = m.ready;
+      if (!this.ready) this.operations.markIndeterminate("Photopea reports disconnected");
+      this.pump(); return;
+    }
+    if (typeof m.id !== "string" || m.id !== this.operations.activeId) return;
+    if (m.type === "load_ack") {
+      if (this.loadAck && m.offset === this.loadAck.offset) this.loadAck.resolve();
       return;
     }
-
-    if (msg.type === "result" || msg.type === "file") {
-      const id = msg.id as string;
-      const pendingIndex = this.queue.findIndex((r) => r.id === id);
-
-      if (pendingIndex === -1) return; // Already resolved (e.g. timed out)
-
-      const pending = this.queue[pendingIndex];
-      clearTimeout(pending.timer);
-      this.queue.splice(pendingIndex, 1);
-      this.pendingScripts.delete(id);
-      this.pendingLoads.delete(id);
-      this.processing = false;
-
-      if (msg.type === "file") {
-        const result: BridgeFileResult = {
-          success: (msg.success as boolean) ?? false,
-          data: Buffer.from((msg.data as string) ?? "", "base64"),
-          mimeType: (msg.mimeType as string) ?? "application/octet-stream",
-          error: (msg.error as string | null) ?? null,
-        };
-        pending.resolve(result);
-      } else {
-        const result: BridgeResult = {
-          success: (msg.success as boolean) ?? false,
-          data: (msg.data as string | null) ?? null,
-          error: (msg.error as string | null) ?? null,
-        };
-        pending.resolve(result);
-      }
-
-      this.processNext();
+    if (m.type === "file_begin") {
+      if (this.transfer) throw new Error("Duplicate file_begin within a connected transfer");
+      const target = this.exports.get(m.id);
+      if (!target || typeof m.byteLength !== "number" || typeof m.sha256 !== "string") throw new Error("Unexpected file manifest");
+      await this.discardTransfer();
+      this.transfer = { writer: await ArtifactWriter.create(target.path, target.format, m.byteLength, m.sha256), offset: 0, sequence: 0 };
+      this.operations.phase(m.id, "transferring"); this.resetStall();
+      this.send({ type: "file_ack", id: m.id, offset: 0 }); return;
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Utilities
-  // ---------------------------------------------------------------------------
-
-  private rejectAllPending(error: Error): void {
-    const snapshot = [...this.queue];
-    this.queue = [];
-    this.processing = false;
-
-    for (const pending of snapshot) {
-      clearTimeout(pending.timer);
-      this.pendingScripts.delete(pending.id);
-      this.pendingLoads.delete(pending.id);
-      // Resolve (not reject) with an error result so callers don't need try/catch
-      pending.resolve({
-        success: false,
-        data: null,
-        error: error.message,
-      });
+    if (m.type === "file_end") {
+      if (!this.transfer || this.transfer.offset !== this.transfer.writer.byteLength) throw new Error("Incomplete file transfer");
+      this.operations.phase(m.id, "persisting"); this.resetStall();
+      const writer = this.transfer.writer;
+      this.operations.candidate(m.id, { path:writer.path, format:writer.format, byteLength:writer.byteLength, sha256:writer.expectedHash });
+      await this.journal?.flush();
+      const artifact = await this.transfer.writer.commit();
+      await this.discardTransfer(); this.exports.delete(m.id);
+      // Clear frontend ownership on the ordered WS before making the lane available.
+      // Callers can enqueue/pump immediately when complete resolves their promise.
+      this.send({ type: "settled", id: m.id });
+      this.operations.complete(m.id, { success: true, data: null, error: null, artifact });
+      // Publication is already committed even if journaling fails. Keep that outcome.
+      try { await this.journal?.flush(); } catch { console.error("Artifact committed; operation journal write failed"); }
+      this.pump(); return;
+    }
+    if (m.type === "result") {
+      if (typeof m.success !== "boolean" || (m.data !== null && typeof m.data !== "string") || (m.error !== null && typeof m.error !== "string")) throw new Error("Invalid result schema");
+      if (this.transfer) throw new Error("Text result while transferring file");
+      const expectsFile = this.exports.has(m.id);
+      const result: BridgeResult = expectsFile && m.success ? { success: false, data: null, error: "Export ended without binary artifact" } : { success: m.success, data: m.data, error: m.error };
+      this.exports.delete(m.id); this.send({ type: "settled", id: m.id });
+      this.operations.complete(m.id, result); this.pump(); return;
     }
   }
 }
