@@ -415,8 +415,13 @@
           }
         };
 
-        ws.onclose = function () {
+        ws.onclose = function (event) {
           setConnected(false);
+          if (event.code === 1008) {
+            statusText.textContent = 'Another Photopea tab is active — use that tab';
+            addLogEntry('connection', event.reason || 'Connection rejected', true);
+            return;
+          }
           scheduleReconnect();
         };
 

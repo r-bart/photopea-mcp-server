@@ -39,17 +39,19 @@ export class PhotopeaBridge {
     this.wss = new WebSocketServer({ server: this.httpServer });
 
     this.wss.on("connection", (ws: WebSocket) => {
-      // Accept the newest connection; silently release the old one
-      const prev = this.client;
-      this.client = ws;
-
-      if (prev && prev !== ws && prev.readyState === WebSocket.OPEN) {
-        // Silently terminate without triggering our close handler logic
-        prev.removeAllListeners();
-        prev.terminate();
+      // A new tab has a different document session and cannot own in-flight work.
+      if (this.client && this.client.readyState === WebSocket.OPEN) {
+        ws.close(1008, "Another Photopea session is already connected");
+        return;
       }
+      if (this.client) {
+        this.rejectAllPending(new Error("Photopea session replaced after disconnect; inspect document before retrying"));
+      }
+      this.client = ws;
+      this.ready = false;
 
       ws.on("message", (raw) => {
+        if (this.client !== ws) return;
         try {
           const msg = JSON.parse(raw.toString());
           this.handleClientMessage(msg);
